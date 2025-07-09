@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import numpy as np
 
 from typing import Any, Callable, Dict, List, Optional, cast
 
@@ -20,6 +21,11 @@ from llama_index.core.vector_stores.utils import (
     node_to_metadata_dict,
     metadata_dict_to_node,
 )
+from llama_index.core.vector_stores.types import (
+    MetadataFilters,
+    FilterCondition,
+    FilterOperator,
+)
 
 import bm25s
 import Stemmer
@@ -27,9 +33,89 @@ import Stemmer
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_PERSIST_ARGS = {"similarity_top_k": "similarity_top_k", "_verbose": "verbose"}
+DEFAULT_PERSIST_ARGS = {
+    "similarity_top_k": "similarity_top_k",
+    "_verbose": "verbose",
+    "filters": "filters",
+}
 
 DEFAULT_PERSIST_FILENAME = "retriever.json"
+
+
+def _build_metadata_filter_fn(
+    metadata_lookup_fn: Callable[[int], Dict[str, Any]],
+    metadata_filters: Optional[MetadataFilters] = None,
+) -> Callable[[int], bool]:
+    """Build metadata filter function."""
+    filter_list = metadata_filters.filters if metadata_filters else []
+    if not filter_list or not metadata_filters:
+        return lambda _: True
+
+    filter_condition = cast(MetadataFilters, metadata_filters.condition)
+
+    def _process_filter_match(
+        operator: FilterOperator, value: Any, metadata_value: Any
+    ) -> bool:
+        if metadata_value is None:
+            return False
+        if operator == FilterOperator.EQ:
+            return metadata_value == value
+        if operator == FilterOperator.NE:
+            return metadata_value != value
+        if operator == FilterOperator.GT:
+            return metadata_value > value
+        if operator == FilterOperator.GTE:
+            return metadata_value >= value
+        if operator == FilterOperator.LT:
+            return metadata_value < value
+        if operator == FilterOperator.LTE:
+            return metadata_value <= value
+        if operator == FilterOperator.IN:
+            return metadata_value in value
+        if operator == FilterOperator.NIN:
+            return metadata_value not in value
+        if operator == FilterOperator.CONTAINS:
+            return value in metadata_value
+        if operator == FilterOperator.TEXT_MATCH:
+            return value.lower() in metadata_value.lower()
+        if operator == FilterOperator.ALL:
+            return all(val in metadata_value for val in value)
+        if operator == FilterOperator.ANY:
+            return any(val in metadata_value for val in value)
+        raise ValueError(f"Invalid operator: {operator}")
+
+    def filter_fn(idx: int) -> bool:
+        metadata = metadata_lookup_fn(idx)
+
+        filter_matches_list = []
+        for filter_ in filter_list:
+            if isinstance(filter_, MetadataFilters):
+                raise ValueError("Nested MetadataFilters are not supported.")
+
+            metadata_value = metadata.get(filter_.key, None)
+            if filter_.operator == FilterOperator.IS_EMPTY:
+                filter_matches = (
+                    metadata_value is None
+                    or metadata_value == ""
+                    or metadata_value == []
+                )
+            else:
+                filter_matches = _process_filter_match(
+                    operator=filter_.operator,
+                    value=filter_.value,
+                    metadata_value=metadata_value,
+                )
+
+            filter_matches_list.append(filter_matches)
+
+        if filter_condition == FilterCondition.AND:
+            return all(filter_matches_list)
+        elif filter_condition == FilterCondition.OR:
+            return any(filter_matches_list)
+        else:
+            raise ValueError(f"Invalid filter condition: {filter_condition}")
+
+    return filter_fn
 
 
 class BM25Retriever(BaseRetriever):
@@ -47,6 +133,8 @@ class BM25Retriever(BaseRetriever):
             An existing BM25 object to use. If not provided, nodes must be passed.
         similarity_top_k (int, optional):
             The number of results to return. Defaults to DEFAULT_SIMILARITY_TOP_K.
+        filters (MetadataFilters, optional):
+            Metadata filters to apply at query time. Defaults to None.
         callback_manager (CallbackManager, optional):
             The callback manager to use. Defaults to None.
         objects (List[IndexNode], optional):
@@ -69,6 +157,7 @@ class BM25Retriever(BaseRetriever):
         language: str = "en",
         existing_bm25: Optional[bm25s.BM25] = None,
         similarity_top_k: int = DEFAULT_SIMILARITY_TOP_K,
+        filters: Optional[MetadataFilters] = None,
         callback_manager: Optional[CallbackManager] = None,
         objects: Optional[List[IndexNode]] = None,
         object_map: Optional[dict] = None,
@@ -80,6 +169,7 @@ class BM25Retriever(BaseRetriever):
         self.similarity_top_k = similarity_top_k
         self.token_pattern = token_pattern
         self.skip_stemming = skip_stemming
+        self._filters = filters
 
         if existing_bm25 is not None:
             self.bm25 = existing_bm25
@@ -118,6 +208,7 @@ class BM25Retriever(BaseRetriever):
         verbose: bool = False,
         skip_stemming: bool = False,
         token_pattern: str = r"(?u)\b\w\w+\b",
+        filters: Optional[MetadataFilters] = None,
         # deprecated
         tokenizer: Optional[Callable[[str], List[str]]] = None,
     ) -> "BM25Retriever":
@@ -137,15 +228,16 @@ class BM25Retriever(BaseRetriever):
         if docstore is not None:
             nodes = cast(List[BaseNode], list(docstore.docs.values()))
 
-        assert nodes is not None, (
-            "Please pass exactly one of index, nodes, or docstore."
-        )
+        assert (
+            nodes is not None
+        ), "Please pass exactly one of index, nodes, or docstore."
 
         return cls(
             nodes=nodes,
             stemmer=stemmer,
             language=language,
             similarity_top_k=similarity_top_k,
+            filters=filters,
             verbose=verbose,
             skip_stemming=skip_stemming,
             token_pattern=token_pattern,
@@ -153,11 +245,16 @@ class BM25Retriever(BaseRetriever):
 
     def get_persist_args(self) -> Dict[str, Any]:
         """Get Persist Args Dict to Save."""
-        return {
-            DEFAULT_PERSIST_ARGS[key]: getattr(self, key)
-            for key in DEFAULT_PERSIST_ARGS
-            if hasattr(self, key)
-        }
+        persist_dict: Dict[str, Any] = {}
+        for key in DEFAULT_PERSIST_ARGS:
+            if not hasattr(self, key):
+                continue
+            val = getattr(self, key)
+            if key == "filters" and val is not None:
+                persist_dict[DEFAULT_PERSIST_ARGS[key]] = val.model_dump()
+            else:
+                persist_dict[DEFAULT_PERSIST_ARGS[key]] = val
+        return persist_dict
 
     def persist(self, path: str, encoding: str = "utf-8", **kwargs: Any) -> None:
         """Persist the retriever to a directory."""
@@ -175,6 +272,10 @@ class BM25Retriever(BaseRetriever):
         bm25 = bm25s.BM25.load(path, load_corpus=True, **kwargs)
         with open(os.path.join(path, DEFAULT_PERSIST_FILENAME), encoding=encoding) as f:
             retriever_data = json.load(f)
+        if "filters" in retriever_data and retriever_data["filters"] is not None:
+            retriever_data["filters"] = MetadataFilters.model_validate(
+                retriever_data["filters"]
+            )
         return cls(existing_bm25=bm25, **retriever_data)
 
     def _retrieve(self, query_bundle: QueryBundle) -> List[NodeWithScore]:
@@ -185,8 +286,19 @@ class BM25Retriever(BaseRetriever):
             token_pattern=self.token_pattern,
             show_progress=self._verbose,
         )
+        weight_mask = None
+        if self._filters is not None:
+            filter_fn = _build_metadata_filter_fn(
+                lambda idx: self.corpus[idx], self._filters
+            )
+            mask = [1.0 if filter_fn(i) else 0.0 for i in range(len(self.corpus))]
+            weight_mask = np.array(mask)
+
         indexes, scores = self.bm25.retrieve(
-            tokenized_query, k=self.similarity_top_k, show_progress=self._verbose
+            tokenized_query,
+            k=self.similarity_top_k,
+            show_progress=self._verbose,
+            weight_mask=weight_mask,
         )
 
         # batched, but only one query

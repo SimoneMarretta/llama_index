@@ -2,6 +2,7 @@ from llama_index.core import Document
 from llama_index.core.base.base_retriever import BaseRetriever
 from llama_index.retrievers.bm25.base import BM25Retriever
 from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.vector_stores.types import MetadataFilters, ExactMatchFilter
 
 
 def test_class():
@@ -25,3 +26,21 @@ def test_scores():
     for node in result_nodes:
         assert node.score is not None
         assert node.score > 0.0
+
+
+def test_filters():
+    documents = [
+        Document(text="Alpha", metadata={"category": "a"}),
+        Document(text="Beta", metadata={"category": "b"}),
+    ]
+
+    splitter = SentenceSplitter(chunk_size=1024)
+    nodes = splitter.get_nodes_from_documents(documents)
+
+    filters = MetadataFilters(filters=[ExactMatchFilter(key="category", value="a")])
+    retriever = BM25Retriever.from_defaults(
+        nodes=nodes, similarity_top_k=2, filters=filters
+    )
+
+    result_nodes = retriever.retrieve("Alpha")
+    assert all(node.metadata.get("category") == "a" for node in result_nodes)
