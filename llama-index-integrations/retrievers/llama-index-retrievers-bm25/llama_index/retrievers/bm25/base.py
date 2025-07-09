@@ -51,7 +51,7 @@ def _build_metadata_filter_fn(
     if not filter_list or not metadata_filters:
         return lambda _: True
 
-    filter_condition = cast(MetadataFilters, metadata_filters.condition)
+    filter_condition = metadata_filters.condition
 
     def _process_filter_match(
         operator: FilterOperator, value: Any, metadata_value: Any
@@ -287,6 +287,7 @@ class BM25Retriever(BaseRetriever):
             show_progress=self._verbose,
         )
         weight_mask = None
+        filter_fn = None
         if self._filters is not None:
             filter_fn = _build_metadata_filter_fn(
                 lambda idx: self.corpus[idx], self._filters
@@ -310,9 +311,15 @@ class BM25Retriever(BaseRetriever):
             # idx can be an int or a dict of the node
             if isinstance(idx, dict):
                 node = metadata_dict_to_node(idx)
+                idx_val = int(node.node_id)
             else:
                 node_dict = self.corpus[int(idx)]
                 node = metadata_dict_to_node(node_dict)
+                idx_val = int(idx)
+
+            if filter_fn is not None and not filter_fn(idx_val):
+                continue
+
             nodes.append(NodeWithScore(node=node, score=float(score)))
 
         return nodes
